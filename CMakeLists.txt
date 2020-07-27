@@ -88,7 +88,7 @@ message(STATUS objs "${objs}")
 add_custom_command(TARGET ${PROJECT_NAME}
 	POST_BUILD
 	COMMAND
-    llvm-link-10 "${objs}" -S \| sed -e \"s/LTOUNIT\\\", i32 0/LTO Unit\\\", i32 1/g\" \| opt-10 -o $<TARGET_FILE:${PROJECT_NAME}>
+    llvm-link-10 "${objs}" -S \| sed -e \"s/LTOUnit\\\", i32 0/LTOUnit\\\", i32 1/g\" \| opt-10 -o $<TARGET_FILE:${PROJECT_NAME}>
     COMMAND_EXPAND_LISTS
 )
 
