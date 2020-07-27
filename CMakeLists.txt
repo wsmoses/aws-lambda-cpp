@@ -7,18 +7,20 @@ project(aws-lambda-runtime
 option(ENABLE_LTO "Enables link-time optimization, requires compiler support." ON)
 option(ENABLE_TESTS "Enables building the test project, requires AWS C++ SDK." OFF)
 
-add_library(${PROJECT_NAME}
+set(PROJECT_TMP ${PROJECT_NAME}-tmp)
+
+add_library(${PROJECT_TMP}
     "src/logging.cpp"
     "src/runtime.cpp"
     "src/backward.cpp"
     "${CMAKE_CURRENT_BINARY_DIR}/version.cpp"
     )
 
-set_target_properties(${PROJECT_NAME} PROPERTIES
+set_target_properties(${PROJECT_TMP} PROPERTIES
     SOVERSION 0
     VERSION ${PROJECT_VERSION})
 
-target_include_directories(${PROJECT_NAME} PUBLIC
+target_include_directories(${PROJECT_TMP} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
@@ -26,7 +28,7 @@ if (ENABLE_LTO)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT has_lto OUTPUT lto_check_output)
     if(has_lto)
-        set_property(TARGET ${PROJECT_NAME} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set_property(TARGET ${PROJECT_TMP} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
     else()
         message(WARNING "Link-time optimization (LTO) is not supported: ${lto_check_output}")
     endif()
@@ -34,14 +36,14 @@ endif()
 
 find_package(CURL REQUIRED)
 if (CMAKE_VERSION VERSION_LESS 3.12)
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${CURL_LIBRARIES})
+    target_link_libraries(${PROJECT_TMP} PRIVATE ${CURL_LIBRARIES})
 else()
-    target_link_libraries(${PROJECT_NAME} PRIVATE CURL::libcurl)
+    target_link_libraries(${PROJECT_TMP} PRIVATE CURL::libcurl)
 endif()
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${CURL_INCLUDE_DIRS})
+target_include_directories(${PROJECT_TMP} PRIVATE ${CURL_INCLUDE_DIRS})
 
-target_compile_options(${PROJECT_NAME} PRIVATE
+target_compile_options(${PROJECT_TMP} PRIVATE
     "-fno-exceptions"
     "-fno-rtti"
     "-fvisibility=hidden"
@@ -52,27 +54,46 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     "-Wconversion"
     "-Wno-sign-conversion")
 
+target_compile_definitions(${PROJECT_TMP} PRIVATE "BACKWARD_HAS_UNWIND=1")
+target_compile_definitions(${PROJECT_TMP} PRIVATE "BACKWARD_SYSTEM_UNKNOWN=1")
 find_library(DW_LIB NAMES dw)
 if (NOT DW_LIB STREQUAL DW_LIB-NOTFOUND)
     message("-- Enhanced stack-traces are enabled via libdw: ${DW_LIB}")
-    target_compile_definitions(${PROJECT_NAME} PRIVATE "BACKWARD_HAS_DW=1")
-    target_link_libraries(${PROJECT_NAME} PUBLIC "${DW_LIB}")
+    target_compile_definitions(${PROJECT_TMP} PRIVATE "BACKWARD_HAS_DW=1")
+    target_link_libraries(${PROJECT_TMP} PUBLIC "${DW_LIB}")
 else()
     find_library(BFD_LIB NAMES bfd)
     if (NOT BFD_LIB STREQUAL BFD_LIB-NOTFOUND)
         message("-- Enhanced stack-traces are enabled via libbfd: ${BFD_LIB}")
-        target_compile_definitions(${PROJECT_NAME} PRIVATE "BACKWARD_HAS_BFD=1")
-        target_link_libraries(${PROJECT_NAME} PRIVATE "${BFD_LIB}")
+        target_compile_definitions(${PROJECT_TMP} PRIVATE "BACKWARD_HAS_BFD=1")
+        target_link_libraries(${PROJECT_TMP} PRIVATE "${BFD_LIB}")
+    else()
+        find_library(DWARF_LIB NAMES dwarf)
+        if (NOT DWARF_LIB STREQUAL DWARF_LIB-NOTFOUND)
+            message("-- Enhanced stack-traces are enabled via libdwarf: ${DWARF_LIB}")
+            target_compile_definitions(${PROJECT_TMP} PRIVATE "BACKWARD_HAS_DWARF=1")
+            target_link_libraries(${PROJECT_TMP} PRIVATE "${DWARF_LIB}")
+        endif()
     endif()
 endif()
 
 if (LOG_VERBOSITY)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE "AWS_LAMBDA_LOG=${LOG_VERBOSITY}")
+    target_compile_definitions(${PROJECT_TMP} PRIVATE "AWS_LAMBDA_LOG=${LOG_VERBOSITY}")
 elseif(CMAKE_BUILD_TYPE STREQUAL Debug)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE "AWS_LAMBDA_LOG=3")
+    target_compile_definitions(${PROJECT_TMP} PRIVATE "AWS_LAMBDA_LOG=3")
 else ()
-    target_compile_definitions(${PROJECT_NAME} PRIVATE "AWS_LAMBDA_LOG=0")
+    target_compile_definitions(${PROJECT_TMP} PRIVATE "AWS_LAMBDA_LOG=0")
 endif()
+
+list(APPEND objs $<JOIN:$<TARGET_OBJECTS:${PROJECT_TMP}>,$<SEMICOLON>>) 
+message(STATUS objs "${objs}")
+add_custom_target(${PROJECT_NAME} ALL)
+add_custom_command(TARGET ${PROJECT_NAME}
+    COMMAND llvm-link-10 "${objs}" -S \| sed -e \"s/LTOUNIT\\\", i32 0/LTO Unit\\\", i32 1/g\" \| opt-10 -o ${CMAKE_CURRENT_BINARY_DIR}/lib${PROJECT_NAME}.a
+    DEPENDS ${PROJECT_TMP} $<TARGET_OBJECTS:${PROJECT_TMP}>
+    COMMAND_EXPAND_LISTS
+)
+#    VERBATIM
 
 #tests
 if (ENABLE_TESTS)
@@ -106,22 +127,17 @@ install(FILES "include/aws/logging/logging.h"
     DESTINATION "include/aws/logging")
 
 include(GNUInstallDirs)
-install(TARGETS ${PROJECT_NAME}
-    EXPORT ${PROJECT_NAME}-targets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    )
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/lib${PROJECT_NAME}.a DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/${PROJECT_NAME}-config.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
     @ONLY)
 
-export(EXPORT "${PROJECT_NAME}-targets" NAMESPACE AWS::)
+#export(EXPORT "${PROJECT_NAME}-targets" NAMESPACE AWS::)
 
-install(EXPORT "${PROJECT_NAME}-targets"
-    DESTINATION "${CMAKE_INSTALL_LIBDIR}/${PROJECT_NAME}/cmake/"
-    NAMESPACE AWS::)
+#install(EXPORT "${PROJECT_NAME}-targets"
+#    DESTINATION "${CMAKE_INSTALL_LIBDIR}/${PROJECT_NAME}/cmake/"
+#    NAMESPACE AWS::)
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config-version.cmake"
